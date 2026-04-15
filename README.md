@@ -81,11 +81,17 @@ Shows every registered session with its current state:
 
 ### Timeline chart (`2` or `tab`)
 
-Stacked bar chart showing session activity over the last 2 hours. Each column is a time bucket, coloured by category:
+Stacked bar chart showing session activity over time. Each column is a time bucket, coloured by category:
 
 - **Yellow** — active (processing, running tools, planning, compacting)
 - **Green** — waiting for user input
 - **Red** — waiting for permission approval
+
+Use `-`/`+` to zoom between 12 levels:
+
+`5m` · `15m` · `30m` · `1h` · **`2h`** (default) · `4h` · `8h` · `1d` · `3d` · `1w` · `1mo` · `3mo`
+
+X-axis labels adapt automatically — `HH:MM` for short windows, `Mon HHh` for multi-day, `Jan 02` for weeks/months.
 
 ## Session states
 
@@ -107,6 +113,8 @@ Stacked bar chart showing session activity over the last 2 hours. Each column is
 | `tab` | Toggle between Sessions and Timeline views |
 | `1` / `2` | Jump to Sessions / Timeline |
 | `j` / `k` | Navigate session list |
+| `-` / `[` | Zoom out (timeline) |
+| `+` / `]` | Zoom in (timeline) |
 | `r` | Force refresh |
 | `c` | Clean up stale state files (dead PIDs) |
 | `q` | Quit |

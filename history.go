@@ -59,12 +59,9 @@ func categoriseStatus(s Status) StatusCategory {
 	}
 }
 
-// ReadHistory reads the JSONL history file and returns entries within the given duration.
-func ReadHistory(window time.Duration) ([]HistoryEntry, error) {
-	home, _ := os.UserHomeDir()
-	historyPath := filepath.Join(home, ".claude", "session-states", "history.jsonl")
-
-	f, err := os.Open(historyPath)
+// readHistoryFile reads one JSONL history path and returns entries newer than cutoff.
+func readHistoryFile(path string, cutoff time.Time) ([]HistoryEntry, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -73,11 +70,8 @@ func ReadHistory(window time.Duration) ([]HistoryEntry, error) {
 	}
 	defer f.Close()
 
-	cutoff := time.Now().Add(-window)
 	var entries []HistoryEntry
-
 	scanner := bufio.NewScanner(f)
-	// Increase buffer size for long lines
 	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
 
 	for scanner.Scan() {
@@ -92,12 +86,68 @@ func ReadHistory(window time.Duration) ([]HistoryEntry, error) {
 		e.parsedTime = t
 		entries = append(entries, e)
 	}
+	if err := scanner.Err(); err != nil {
+		return entries, err
+	}
+	return entries, nil
+}
 
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].parsedTime.Before(entries[j].parsedTime)
+// mergeHistoryEntries merges two sorted-by-time slices into one sorted slice.
+func mergeHistoryEntries(a, b []HistoryEntry) []HistoryEntry {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	out := make([]HistoryEntry, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i].parsedTime.Before(b[j].parsedTime) {
+			out = append(out, a[i])
+			i++
+		} else {
+			out = append(out, b[j])
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	out = append(out, b[j:]...)
+	return out
+}
+
+// ReadHistory reads Claude and Cursor JSONL history files and returns merged
+// entries within the given duration, sorted by time.
+func ReadHistory(window time.Duration) ([]HistoryEntry, error) {
+	home, _ := os.UserHomeDir()
+	claudePath := filepath.Join(home, ".claude", "session-states", "history.jsonl")
+	cursorPath := filepath.Join(home, ".cursor", "session-tracker", "history.jsonl")
+
+	cutoff := time.Now().Add(-window)
+
+	var merged []HistoryEntry
+
+	claudeEntries, err := readHistoryFile(claudePath, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(claudeEntries, func(i, j int) bool {
+		return claudeEntries[i].parsedTime.Before(claudeEntries[j].parsedTime)
 	})
 
-	return entries, nil
+	cursorEntries, err := readHistoryFile(cursorPath, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(cursorEntries, func(i, j int) bool {
+		return cursorEntries[i].parsedTime.Before(cursorEntries[j].parsedTime)
+	})
+
+	merged = mergeHistoryEntries(claudeEntries, cursorEntries)
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].parsedTime.Before(merged[j].parsedTime)
+	})
+	return merged, nil
 }
 
 // staleTimeout caps how long a session can sit in the replay without a fresh

@@ -159,10 +159,9 @@ func tickEvery(d time.Duration) tea.Cmd {
 
 func (m Model) fetchSessions() tea.Msg {
 	sessions, _ := m.reader.ReadAll()
-	// Self-heal the history log: emit synthetic "ended" transitions for any
-	// session whose PID is dead but whose last recorded status isn't terminal.
-	// Without this, orphaned sessions stay in the replay map forever and inflate
-	// concurrent-session counts at wide zoom levels.
+	// Self-heal: synthetic "ended" when Claude PID is gone but state is non-terminal,
+	// or when a Cursor session is stale (24h) without a terminal state—so timeline
+	// counts do not stay inflated.
 	m.reader.SealDeadSessions(sessions)
 	return sessionsMsg(sessions)
 }
@@ -275,7 +274,7 @@ func (m Model) View() string {
 			aliveCount++
 		}
 	}
-	title := styleTitle.Render("Claude Code Dashboard")
+	title := styleTitle.Render("AI Session Dashboard")
 	count := styleDim.Render(fmt.Sprintf(" %d sessions, %d alive", len(m.sessions), aliveCount))
 	b.WriteString(title + count)
 
@@ -322,7 +321,7 @@ func (m Model) View() string {
 
 func (m Model) renderTable(b *strings.Builder) {
 	if len(m.sessions) == 0 {
-		b.WriteString(styleDim.Render("  No sessions found. Start a Claude Code session to see it here.\n"))
+		b.WriteString(styleDim.Render("  No sessions found. Start a Claude Code or Cursor agent session (with hooks) to see it here.\n"))
 		return
 	}
 
@@ -387,13 +386,13 @@ func (m Model) renderTimeline(b *strings.Builder) {
 	b.WriteString(zoomInfo + styleDim.Render("  (- zoom out, + zoom in)") + "\n\n")
 
 	if len(m.buckets) == 0 {
-		b.WriteString(styleDim.Render("  No history data yet. Use Claude Code for a bit and check back.\n"))
+		b.WriteString(styleDim.Render("  No history data yet. Use Claude Code or Cursor for a bit and check back.\n"))
 		return
 	}
 
 	maxTotal := MaxBucketTotal(m.buckets)
 	if maxTotal == 0 {
-		b.WriteString(styleDim.Render(fmt.Sprintf("  No active sessions in the last %s.\n", m.zoomLabel())))
+		b.WriteString(styleDim.Render(fmt.Sprintf("  No active sessions in the last %s (Claude + Cursor).\n", m.zoomLabel())))
 		return
 	}
 

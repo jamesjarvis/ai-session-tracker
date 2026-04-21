@@ -1,41 +1,127 @@
 # ai-session-tracker
 
-A terminal dashboard for monitoring Claude Code sessions in real-time. See what every parallel session is doing — processing, running tools, waiting for input, or stuck on a permission prompt — at a glance.
+A terminal dashboard for monitoring **Claude Code** and **Cursor** agent sessions in real time: processing, running tools, waiting for input, compacting, or idle—at a glance in one place.
 
 ## How it works
 
+Hooks run inside each product and write small JSON files. The Go TUI polls about every **5 seconds**, merges **both** sources, and renders a session table plus a timeline.
+
 ```
-Claude Code hooks (Python)          Go TUI
-┌──────────────────────┐       ┌──────────────────┐
-│  SessionStart        │       │                  │
-│  UserPromptSubmit    │──────>│  Sessions table  │
-│  PreToolUse          │ JSON  │  Timeline chart  │
-│  Stop / SessionEnd   │ files │                  │
-│  ...                 │       │  Refreshes / 5s  │
-└──────────────────────┘       └──────────────────┘
-~/.claude/session-states/       reads + PID liveness
+┌─────────────────────────┐     ┌─────────────────────────┐
+│  Claude Code (hooks)    │     │  Cursor (hooks)         │
+│  settings.json → py    │     │  hooks.json → py        │
+└───────────┬─────────────┘     └───────────┬─────────────┘
+            │                               │
+            ▼                               ▼
+   ~/.claude/sessions/              ~/.cursor/session-tracker/
+   ~/.claude/session-states/        ├── sessions/{slug}.json   (registry)
+                                    ├── states/{slug}.json     (live state)
+                                    └── history.jsonl        (append-only)
+
+            └───────────────┬─────────────────┘
+                            ▼
+                   Go TUI (bubbletea)
+                   Sessions + timeline
 ```
 
-A Python hook fires on every Claude Code lifecycle event and writes:
-- **Current state** per session to `~/.claude/session-states/{pid}.json` (atomic overwrite)
-- **Transition history** to `~/.claude/session-states/history.jsonl` (append-only log)
+### Claude Code data layout
 
-The Go TUI reads these files every 5 seconds, cross-references with Claude's session registry (`~/.claude/sessions/`), checks PID liveness, and renders the dashboard. If a session's PID is gone but its last recorded status isn't terminal (e.g. it was `kill -9`'d or the terminal was closed), the TUI appends a synthetic `ended` transition to the history log so the session no longer counts as active in the timeline replay.
+- **Registry:** `~/.claude/sessions/{pid}.json` (one file per OS process ID).
+- **Live state:** `~/.claude/session-states/{pid}.json` (atomic overwrite).
+- **History:** `~/.claude/session-states/history.jsonl` (one JSON object per line).
 
-## Setup
+The TUI checks **PID liveness** with `kill(pid, 0)`. If a process is gone but the last state was not terminal (crash, `kill -9`, closed terminal), the app **seals** the session: it appends a synthetic `ended` line to history and rewrites the state file so the timeline does not count it as active forever.
 
-### 1. Install the hook
+### Cursor data layout
 
-Copy the hook script into your Claude config:
+- **Registry:** `~/.cursor/session-tracker/sessions/{slug}.json`
+- **Live state:** `~/.cursor/session-tracker/states/{slug}.json`
+- **History:** `~/.cursor/session-tracker/history.jsonl`
+
+Here **`slug`** is the **SHA-256 hex** (64 characters) of the Cursor `conversation_id`, so paths stay safe on disk and match the hook in this repo (`hooks/cursor-session-state-tracker.py` and `state.go`).
+
+There is **no real OS PID** for Cursor sessions. The TUI treats a Cursor row as **inactive** when the state is **`ended`** or when there has been **no state update for 24 hours** (staleness). In the latter case it **seals** the session the same way as Claude (synthetic `ended` + state rewrite).
+
+### Timeline
+
+The chart merges **both** `history.jsonl` files, sorted by timestamp. A **24h staleness** rule also applies when *replaying* buckets so old orphan transitions do not inflate counts at wide zoom levels.
+
+---
+
+## Setup: Cursor
+
+### 1. Install the hook script
+
+This repository ships the Cursor tracker:
 
 ```sh
-cp hooks/session-state-tracker.py ~/.claude/hooks/
-mkdir -p ~/.claude/session-states
+mkdir -p ~/.cursor/hooks
+cp hooks/cursor-session-state-tracker.py ~/.cursor/hooks/
+chmod +x ~/.cursor/hooks/cursor-session-state-tracker.py
 ```
 
-### 2. Wire up `~/.claude/settings.json`
+The script is **stdlib-only** (Python 3). It writes under `~/.cursor/session-tracker/` and always returns JSON that keeps the agent unblocked (for example `{"permission":"allow"}` on `preToolUse`).
 
-Add the hook to every event type in your `settings.json` hooks section. Each event needs an entry like:
+### 2. Wire up Cursor hooks
+
+Use **user** hooks (global) or **project** hooks (repo-only). Paths are resolved relative to the hook config location:
+
+| Config | File | Hook command path example |
+|--------|------|---------------------------|
+| User | `~/.cursor/hooks.json` | `python3 ./hooks/cursor-session-state-tracker.py` (cwd is `~/.cursor/`) |
+| Project | `<repo>/.cursor/hooks.json` | `python3 .cursor/hooks/cursor-session-state-tracker.py` (cwd is project root) |
+
+Minimal **`~/.cursor/hooks.json`** (user):
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "python3 ./hooks/cursor-session-state-tracker.py" }],
+    "sessionEnd": [{ "command": "python3 ./hooks/cursor-session-state-tracker.py" }],
+    "beforeSubmitPrompt": [{ "command": "python3 ./hooks/cursor-session-state-tracker.py" }],
+    "preToolUse": [{ "command": "python3 ./hooks/cursor-session-state-tracker.py" }],
+    "postToolUse": [{ "command": "python3 ./hooks/cursor-session-state-tracker.py" }],
+    "postToolUseFailure": [{ "command": "python3 ./hooks/cursor-session-state-tracker.py" }],
+    "preCompact": [{ "command": "python3 ./hooks/cursor-session-state-tracker.py" }],
+    "stop": [{ "command": "python3 ./hooks/cursor-session-state-tracker.py" }]
+  }
+}
+```
+
+If you already have a `hooks.json`, **merge** these entries with your existing hooks instead of replacing the file. Cursor reloads hook config on save; restart the app if something does not pick up.
+
+### 3. Cursor → state mapping (what the hook writes)
+
+| Cursor hook | Tracked status / notes |
+|-------------|-------------------------|
+| `sessionStart` | `waiting_for_input` |
+| `beforeSubmitPrompt` | `processing` (user just submitted) |
+| `preToolUse` | `running_tool` + tool name |
+| `postToolUse` | `processing` |
+| `postToolUseFailure` | `processing` (with failure hint in `last_event`) |
+| `preCompact` | `compacting` |
+| `stop` / `sessionEnd` | `ended` |
+
+Cursor does not expose the same permission/notification hooks as Claude Code, so **NEEDS APPROVAL** is uncommon for Cursor-backed rows unless you extend the hook yourself.
+
+---
+
+## Setup: Claude Code
+
+Claude Code expects a **command hook** that reads JSON on stdin and updates `~/.claude/session-states/` (and history). That hook is **not** vendored in this repository; use your own script or another project’s `session-state-tracker.py` if you have one. The on-disk **shape** the TUI expects matches the sections above (`SessionMeta` / `SessionState` fields used in `state.go`).
+
+### 1. Directories
+
+```sh
+mkdir -p ~/.claude/hooks ~/.claude/session-states
+```
+
+Install your Claude hook under `~/.claude/hooks/` and reference it from **`~/.claude/settings.json`**.
+
+### 2. Example `settings.json` hook wiring
+
+Each event needs an entry similar to:
 
 ```json
 {
@@ -57,22 +143,32 @@ Add the hook to every event type in your `settings.json` hooks section. Each eve
 }
 ```
 
-### 3. Build and run
+Adjust the `python3 …` path to match where your Claude hook actually lives.
+
+---
+
+## Build and run
 
 ```sh
 go build -o ai-session-tracker .
 ./ai-session-tracker
 ```
 
+```sh
+go test ./...
+```
+
+---
+
 ## Views
 
 ### Sessions table (`1` or `tab`)
 
-Shows every registered session with its current state:
+Shows every registered session (Claude + Cursor) with its current state:
 
 | Column | Description |
-|---|---|
-| SESSION | Session name (from `--resume` name) or project directory |
+|--------|-------------|
+| SESSION | Claude: resume name or CWD basename. Cursor: name field or CWD / conversation id. |
 | PROJECT | Working directory basename |
 | STATUS | Colour-coded current state |
 | TOOL | Which tool is running (if any) |
@@ -81,53 +177,65 @@ Shows every registered session with its current state:
 
 ### Timeline chart (`2` or `tab`)
 
-Stacked bar chart showing session activity over time. Each column is a time bucket, coloured by category:
+Stacked bar chart of activity over time. Each column is a time bucket:
 
 - **Yellow** — active (processing, running tools, planning, compacting)
 - **Green** — waiting for user input
-- **Red** — waiting for permission approval
+- **Red** — waiting for permission approval (mainly Claude when your hook reports it)
 
-Use `-`/`+` to zoom between 12 levels:
+Use `-` / `+` to zoom across **12** levels:
 
 `5m` · `15m` · `30m` · `1h` · **`2h`** (default) · `4h` · `8h` · `1d` · `3d` · `1w` · `1mo` · `3mo`
 
-X-axis labels adapt automatically — `HH:MM` for short windows, `Mon HHh` for multi-day, `Jan 02` for weeks/months.
+X-axis labels adapt: `HH:MM` for short windows, `Mon HHh` for multi-day, `Jan 02` for weeks/months.
+
+---
 
 ## Session states
 
-| State | Colour | Trigger |
-|---|---|---|
-| Processing | Yellow | Claude is thinking |
-| Running Tool | Blue | Executing a tool (Read, Bash, etc.) |
-| Waiting | Green | Idle, waiting for user input |
-| NEEDS APPROVAL | Red | Permission prompt shown |
-| Planning | Magenta | Plan mode active |
-| Compacting | Cyan | Context window compaction |
-| Dead | Red (dim) | PID no longer alive |
-| Ended | Grey | Session exited cleanly (or was sealed after a non-clean exit) |
+| State | Colour | Meaning |
+|-------|--------|---------|
+| Processing | Yellow | Model working after input or between tools |
+| Running Tool | Blue | A tool call is in flight |
+| Waiting | Green | Waiting for user input |
+| NEEDS APPROVAL | Red | Permission prompt (Claude when hooked; rare on Cursor) |
+| Planning | Magenta | Plan mode (when the hook reports it) |
+| Compacting | Cyan | Context compaction |
+| Dead | Red (dim) | Claude: PID gone. Cursor: stale (no update in 24h) until sealed |
+| Ended | Grey | Session ended cleanly, or sealed after a non-clean stop |
 
-Timeline replay also applies a 24h staleness cap: any session that hasn't transitioned within 24h of a given bucket is dropped from that bucket's count, as a belt-and-braces safeguard against orphan history entries from before self-healing was introduced.
+---
 
 ## Key bindings
 
 | Key | Action |
-|---|---|
-| `tab` | Toggle between Sessions and Timeline views |
+|-----|--------|
+| `tab` | Toggle Sessions / Timeline |
 | `1` / `2` | Jump to Sessions / Timeline |
-| `j` / `k` | Navigate session list |
+| `j` / `k` | Move selection (sessions table) |
 | `-` / `[` | Zoom out (timeline) |
 | `+` / `]` | Zoom in (timeline) |
 | `r` | Force refresh |
-| `c` | Clean up stale state files (dead PIDs) |
+| `c` | Remove stale **state** files: Claude dead PIDs; Cursor inactive (`ended` or stale) sessions |
 | `q` | Quit |
+
+---
 
 ## Project structure
 
 ```
-main.go      Entry point
-state.go     Session metadata + state file reader, PID liveness checks
-history.go   JSONL history reader, time-bucket aggregation for timeline
-ui.go        Bubbletea TUI model, table + timeline rendering, lipgloss styles
+main.go       Entry point
+state.go      Merged reader: Claude + Cursor paths, liveness, seal/clean
+history.go    Merged JSONL history, bucket aggregation
+ui.go         Bubble Tea TUI: table + timeline, lipgloss styles
 hooks/
-  session-state-tracker.py   Claude Code hook (install to ~/.claude/hooks/)
+  cursor-session-state-tracker.py   Cursor hooks → ~/.cursor/session-tracker/
 ```
+
+---
+
+## Troubleshooting
+
+- **No Cursor sessions:** Confirm `~/.cursor/hooks.json` paths match where you installed the script, that `python3` runs it, and that the Hooks output channel in Cursor shows no errors.
+- **Hooks block the agent:** The shipped Cursor script only observes and allows tool use; if you customize it, keep returning valid JSON (including `permission` on gated hooks).
+- **PermissionRequest / Notification on Cursor:** Not applicable in Cursor the same way as Claude; the dashboard still supports those **states** when driven by Claude hooks.

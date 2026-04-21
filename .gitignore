@@ -1,2 +1,6 @@
 bin/
 ai-session-tracker
+
+# Python (e.g. hooks/*.py)
+__pycache__/
+*.py[cod]

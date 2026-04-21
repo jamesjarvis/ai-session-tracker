@@ -202,6 +202,90 @@ func (r *StateReader) CleanStale(sessions []Session) int {
 	return cleaned
 }
 
+// SealDeadSessions finds session-state files whose PIDs are no longer alive
+// and whose last recorded status isn't terminal, then appends a synthetic
+// "ended" transition to history.jsonl and atomically rewrites the state file
+// so we don't re-emit on the next tick. Returns the number of sessions sealed.
+func (r *StateReader) SealDeadSessions(sessions []Session) int {
+	sealed := 0
+	historyPath := filepath.Join(r.statesDir, "history.jsonl")
+
+	for _, s := range sessions {
+		if s.Alive {
+			continue
+		}
+		if s.State == nil {
+			continue
+		}
+		if s.State.Status == StatusEnded {
+			continue
+		}
+
+		nowISO := time.Now().UTC().Format(time.RFC3339Nano)
+		sealed++
+
+		entry := map[string]any{
+			"session_id":   s.State.SessionID,
+			"pid":          s.State.PID,
+			"cwd":          s.State.CWD,
+			"status":       string(StatusEnded),
+			"current_tool": nil,
+			"last_event":   "SyntheticEnded",
+			"timestamp":    nowISO,
+			"tty":          s.State.TTY,
+		}
+		line, err := json.Marshal(entry)
+		if err != nil {
+			sealed--
+			continue
+		}
+		line = append(line, '\n')
+
+		if err := appendHistoryLine(historyPath, line); err != nil {
+			sealed--
+			continue
+		}
+
+		updated := *s.State
+		updated.Status = StatusEnded
+		updated.CurrentTool = nil
+		updated.LastEvent = "SyntheticEnded"
+		updated.Timestamp = nowISO
+		stateFile := filepath.Join(r.statesDir, fmt.Sprintf("%d.json", s.Meta.PID))
+		_ = atomicWriteJSON(stateFile, r.statesDir, updated)
+	}
+	return sealed
+}
+
+func appendHistoryLine(path string, line []byte) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(line)
+	return err
+}
+
+func atomicWriteJSON(target, tmpDir string, v any) error {
+	tmp, err := os.CreateTemp(tmpDir, "*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	enc := json.NewEncoder(tmp)
+	if err := enc.Encode(v); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, target)
+}
+
 func isProcessAlive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }

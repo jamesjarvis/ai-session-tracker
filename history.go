@@ -100,6 +100,13 @@ func ReadHistory(window time.Duration) ([]HistoryEntry, error) {
 	return entries, nil
 }
 
+// staleTimeout caps how long a session can sit in the replay without a fresh
+// transition before we stop counting it. Sessions that end without a SessionEnd
+// hook firing (SIGKILL, crash, closed terminal) never get a terminal entry in
+// history.jsonl, so their last-known status would otherwise carry forward
+// forever and inflate counts on wide zoom levels.
+const staleTimeout = 24 * time.Hour
+
 // ComputeBuckets aggregates history entries into fixed-width time buckets.
 // It reconstructs the state of each session at each bucket boundary by
 // replaying transitions forward.
@@ -124,9 +131,10 @@ func ComputeBuckets(entries []HistoryEntry, window time.Duration, numBuckets int
 		sessionID string
 	}
 
-	// Track latest status for each session at each bucket
-	// Approach: walk through buckets left-to-right, maintaining session state
+	// Track latest status + last-transition timestamp for each session.
+	// Walk buckets left-to-right, maintaining session state.
 	sessionStates := make(map[sessionKey]Status)
+	lastTransition := make(map[sessionKey]time.Time)
 	entryIdx := 0
 
 	for i := range buckets {
@@ -137,11 +145,16 @@ func ComputeBuckets(entries []HistoryEntry, window time.Duration, numBuckets int
 			e := entries[entryIdx]
 			key := sessionKey{pid: e.PID, sessionID: e.SessionID}
 			sessionStates[key] = e.Status
+			lastTransition[key] = e.parsedTime
 			entryIdx++
 		}
 
-		// Count sessions by category
-		for _, status := range sessionStates {
+		// Count sessions by category, skipping any that have gone stale
+		// (no transitions within staleTimeout of this bucket).
+		for key, status := range sessionStates {
+			if buckets[i].Time.Sub(lastTransition[key]) > staleTimeout {
+				continue
+			}
 			cat := categoriseStatus(status)
 			switch cat {
 			case CategoryActive:

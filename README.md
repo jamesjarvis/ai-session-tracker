@@ -20,7 +20,7 @@ A Python hook fires on every Claude Code lifecycle event and writes:
 - **Current state** per session to `~/.claude/session-states/{pid}.json` (atomic overwrite)
 - **Transition history** to `~/.claude/session-states/history.jsonl` (append-only log)
 
-The Go TUI reads these files every 5 seconds, cross-references with Claude's session registry (`~/.claude/sessions/`), checks PID liveness, and renders the dashboard.
+The Go TUI reads these files every 5 seconds, cross-references with Claude's session registry (`~/.claude/sessions/`), checks PID liveness, and renders the dashboard. If a session's PID is gone but its last recorded status isn't terminal (e.g. it was `kill -9`'d or the terminal was closed), the TUI appends a synthetic `ended` transition to the history log so the session no longer counts as active in the timeline replay.
 
 ## Setup
 
@@ -104,7 +104,9 @@ X-axis labels adapt automatically — `HH:MM` for short windows, `Mon HHh` for m
 | Planning | Magenta | Plan mode active |
 | Compacting | Cyan | Context window compaction |
 | Dead | Red (dim) | PID no longer alive |
-| Ended | Grey | Session exited cleanly |
+| Ended | Grey | Session exited cleanly (or was sealed after a non-clean exit) |
+
+Timeline replay also applies a 24h staleness cap: any session that hasn't transitioned within 24h of a given bucket is dropped from that bucket's count, as a belt-and-braces safeguard against orphan history entries from before self-healing was introduced.
 
 ## Key bindings
 

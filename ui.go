@@ -159,6 +159,11 @@ func tickEvery(d time.Duration) tea.Cmd {
 
 func (m Model) fetchSessions() tea.Msg {
 	sessions, _ := m.reader.ReadAll()
+	// Self-heal the history log: emit synthetic "ended" transitions for any
+	// session whose PID is dead but whose last recorded status isn't terminal.
+	// Without this, orphaned sessions stay in the replay map forever and inflate
+	// concurrent-session counts at wide zoom levels.
+	m.reader.SealDeadSessions(sessions)
 	return sessionsMsg(sessions)
 }
 
